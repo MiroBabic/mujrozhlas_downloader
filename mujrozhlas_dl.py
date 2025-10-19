@@ -6,8 +6,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlparse, unquote
-
+from urllib.parse import urlparse, urlsplit, urlunsplit, unquote
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -16,6 +15,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox
 CRO_HOST_RE = re.compile(r"(^|\.)croaod\.cz$", re.I)
 MPD_RE = re.compile(r"\.mpd(\?|$)", re.I)
 MP3_RE = re.compile(r"\.mp3(\?|$)", re.I)
+M4S_RE = re.compile(r"\.m4s(\?|$)", re.I)
 
 HEADERS = {
     "User-Agent": UA,
@@ -27,14 +27,48 @@ HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+COOKIE_SELECTORS = [
+    "#onetrust-accept-btn-handler",
+    "button#onetrust-accept-btn-handler",
+    "button[aria-label*='Přijmout']",
+    "button:has-text('Přijmout vše')",
+    "button:has-text('Souhlasím')",
+    "button:has-text('Rozumím')",
+    "button:has-text('Accept all')",
+    "button:has-text('I agree')",
+]
+
+PLAY_SELECTORS = [
+    "button[aria-label*='Přehrát']",
+    "button[aria-label*='Přehrat']",
+    "button[title*='Přehrát']",
+    ".b-player__control--play",
+    ".player__play",
+    ".js-player-play",
+    "button.play",
+    "button[aria-label='Přehrát']",
+    ".mr-player__play",
+    "button[aria-label*='Play']",
+    "button[title*='Play']",
+]
+
+def segment_to_manifest_url(seg_url: str) -> str | None:
+    """
+    Convert croaod.cz segment ..._mpd.m4s URL to its manifest.mpd.
+    Example:
+      https://.../segment_ctaudio_..._mpd.m4s -> https://.../manifest.mpd
+    """
+    sp = urlsplit(seg_url)
+    parts = (sp.path or "").rsplit("/", 1)
+    if len(parts) == 2 and parts[1].endswith("_mpd.m4s"):
+        manifest_path = parts[0] + "/manifest.mpd"
+        return urlunsplit((sp.scheme, sp.netloc, manifest_path, sp.query, sp.fragment))
+    return None
+
 def filename_from_url(url: str) -> str:
     path = urlparse(url).path or ""
     seg = next((s for s in reversed(path.split("/")) if s), "mujrozhlas")
-    seg = unquote(seg)
-
-    if not seg:
-        seg = "mujrozhlas"
-
+    seg = unquote(seg) or "mujrozhlas"
     return f"{seg}.mp3"
 
 def have_ffmpeg() -> bool:
@@ -65,7 +99,6 @@ def record_dash_to_mp3(mpd_url: str, out_path: Path, referer: str):
         "-y",
         str(out_path),
     ]
-
     spinner = "|/-\\"
     i = 0
     start = time.time()
@@ -80,20 +113,17 @@ def record_dash_to_mp3(mpd_url: str, out_path: Path, referer: str):
             time.sleep(0.15)
             i += 1
     finally:
-        print()  
+        print()
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
-
 
 def download_mp3(url: str, out_path: Path, referer: str):
     headers = dict(HEADERS)
     headers["Referer"] = referer
-
     start = time.time()
     last_print = 0.0
     bytes_done = 0
     human = lambda b: f"{b/1024/1024:.2f} MB"
-
     with requests.get(url, headers=headers, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length") or 0)
@@ -103,24 +133,27 @@ def download_mp3(url: str, out_path: Path, referer: str):
                     continue
                 f.write(chunk)
                 bytes_done += len(chunk)
-                
                 now = time.time()
                 if now - last_print >= 0.1:
                     elapsed = max(now - start, 1e-6)
-                    speed = bytes_done / elapsed  # B/s
+                    speed = bytes_done / elapsed
                     if total > 0:
                         pct = bytes_done / total * 100
                         remaining = max(total - bytes_done, 0)
                         eta = remaining / max(speed, 1e-6)
-                        print(f"\r    {pct:6.2f}%  ({human(bytes_done)}/{human(total)})  "
-                              f"{speed/1024/1024:.2f} MB/s  ETA {int(eta)}s", end="", flush=True)
+                        print(
+                            f"\r    {pct:6.2f}%  ({human(bytes_done)}/{human(total)})  "
+                            f"{speed/1024/1024:.2f} MB/s  ETA {int(eta)}s",
+                            end="", flush=True
+                        )
                     else:
-                        print(f"\r    {human(bytes_done)} downloaded  "
-                              f"{speed/1024/1024:.2f} MB/s", end="", flush=True)
+                        print(
+                            f"\r    {human(bytes_done)} downloaded  "
+                            f"{speed/1024/1024:.2f} MB/s",
+                            end="", flush=True
+                        )
                     last_print = now
-    
     print()
-
 
 def concat_mp3(parts, output_file: Path):
     with tempfile.TemporaryDirectory() as td:
@@ -147,110 +180,154 @@ def host_of(url: str) -> str:
     except Exception:
         return ""
 
-PLAY_SELECTORS = [
-    "button[aria-label*='Přehrát']",
-    "button[aria-label*='Přehrat']",
-    "button[title*='Přehrát']",
-    ".b-player__control--play",
-    ".player__play",
-    ".js-player-play",
-    "button.play",
-    "button[aria-label='Přehrát']",
-]
-
-def collect_streams_with_playwright(page_url: str, dwell_seconds: int = 6) -> list[str]:
+def collect_streams_with_playwright(page_url: str, dwell_seconds: int = 10) -> list[str]:
+    """
+    Attempts to auto-discover croaod.cz .mpd/.mp3 (or .m4s -> infer .mpd) from a mujrozhlas.cz page.
+    May fail if anti-bot protection is triggered.
+    """
     streams = []
     seen = set()
+    manifest_candidates = set()
 
     def maybe_add(url: str):
         if not url or url in seen:
             return
         h = host_of(url) or ""
-        if CRO_HOST_RE.search(h) and (MPD_RE.search(url) or MP3_RE.search(url)):
+        if CRO_HOST_RE.search(h) and (MPD_RE.search(url) or MP3_RE.search(url) or M4S_RE.search(url)):
+            if M4S_RE.search(url):
+                mpd_guess = segment_to_manifest_url(url)
+                if mpd_guess:
+                    manifest_candidates.add(mpd_guess)
             seen.add(url)
             streams.append(url)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--lang=cs"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--lang=cs", "--autoplay-policy=no-user-gesture-required"]
+        )
         ctx = browser.new_context(
             user_agent=UA,
             locale="cs-CZ",
             extra_http_headers={"Accept-Language": "cs,en-US;q=0.7,en;q=0.3"},
         )
+
+        # Listen on CONTEXT to also catch service worker traffic
+        ctx.on("request", lambda req: maybe_add(req.url))
+        ctx.on("response", lambda resp: maybe_add(resp.url))
+
         page = ctx.new_page()
-
-        # Observe requests
-        page.on("request", lambda req: maybe_add(req.url))
-        page.on("response", lambda resp: maybe_add(resp.url))
-
-        
         page.goto("https://www.mujrozhlas.cz/", wait_until="domcontentloaded")
         page.wait_for_timeout(800)
         page.goto(page_url, wait_until="domcontentloaded")
 
-        # Try clicking visible play buttons
+        # Try cookie/consent
+        try:
+            for sel in COOKIE_SELECTORS:
+                try:
+                    btns = page.locator(sel)
+                    if btns.count() > 0:
+                        btns.first.scroll_into_view_if_needed(timeout=1000)
+                        btns.first.click(timeout=1500)
+                        page.wait_for_timeout(600)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Try clicking play buttons
         for sel in PLAY_SELECTORS:
             try:
                 for e in page.locator(sel).all():
                     try:
                         e.scroll_into_view_if_needed(timeout=1000)
-                        e.click(timeout=800)
-                        page.wait_for_timeout(800)
+                        e.click(timeout=1200)
+                        page.wait_for_timeout(900)
                     except Exception:
                         continue
             except Exception:
                 continue
 
-        # Give the player time to fetch manifests
+        # Wait & lazy players
         page.wait_for_timeout(dwell_seconds * 1000)
-
-        # Scroll to bottom to trigger lazy players, click again
         last_h = page.evaluate("document.body.scrollHeight")
         while True:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1200)
             for sel in PLAY_SELECTORS:
                 try:
                     for e in page.locator(sel).all():
                         try:
                             e.scroll_into_view_if_needed(timeout=1000)
-                            e.click(timeout=800)
-                            page.wait_for_timeout(600)
+                            e.click(timeout=1200)
+                            page.wait_for_timeout(700)
                         except Exception:
                             continue
                 except Exception:
                     continue
-            page.wait_for_timeout(800)
             new_h = page.evaluate("document.body.scrollHeight")
             if new_h == last_h:
                 break
             last_h = new_h
 
-        
-        page.wait_for_timeout(1200)
-
+        page.wait_for_timeout(1500)
         ctx.close()
         browser.close()
 
-    
-    return streams
+    # Prefer MPD/MP3; if missing and we saw segments, return inferred MPDs
+    mpd_or_mp3 = [u for u in streams if MPD_RE.search(u) or MP3_RE.search(u)]
+    if not mpd_or_mp3 and manifest_candidates:
+        mpd_or_mp3 = list(manifest_candidates)
+    return mpd_or_mp3
+
+def resolve_input_url(user_url: str) -> list[str]:
+    """
+    Accepts either:
+      - mujrozhlas.cz page URL -> try to sniff
+      - croaod.cz .mpd URL -> use directly
+      - croaod.cz .m4s segment URL -> infer .mpd
+      - croaod.cz .mp3 URL -> use directly
+    Returns a list of URLs to process.
+    """
+    host = host_of(user_url)
+    if CRO_HOST_RE.search(host or ""):
+        if M4S_RE.search(user_url):
+            mpd = segment_to_manifest_url(user_url)
+            return [mpd] if mpd else []
+        return [user_url]  # .mpd or .mp3
+    # Assume mujrozhlas.cz page; attempt to sniff
+    return collect_streams_with_playwright(user_url)
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Headless (Playwright) mujrozhlas stream sniffer → download/record → merge to single MP3."
+        description=(
+            "mujrozhlas downloader:\n"
+            " - Option 1: Provide a mujrozhlas.cz page URL (auto-detect streams; may fail if Cloudflare blocks).\n"
+            " - Option 2: Provide a croaod.cz .mpd URL copied from your browser (after you pass any checks).\n"
+            " - Option 3: Provide a croaod.cz .m4s segment URL; the script will infer manifest.mpd.\n"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
     )
-    ap.add_argument("url", help="mujrozhlas.cz page URL (episode or series)")
-    ap.add_argument("-o", "--output", help="Final merged MP3 filename (default: mujrozhlas_merged.mp3)")
+    ap.add_argument("url", help="mujrozhlas.cz page URL OR croaod.cz .mpd/.mp3/.m4s URL")
+    ap.add_argument("-o", "--output", help="Final merged MP3 filename (default derived from URL)")
     ap.add_argument("--keep-parts", action="store_true", help="Keep per-part MP3 files")
     args = ap.parse_args()
 
     if not have_ffmpeg():
-        die("ffmpeg not found in PATH. Please install ffmpeg.")
+        die("ffmpeg not found in PATH. Please install ffmpeg from official sources and keep it next to this script or in PATH.")
 
-    print(f"Opening headless Chromium and sniffing streams: {args.url}")
-    stream_urls = collect_streams_with_playwright(args.url)
+    # Resolve what to process based on the URL kind
+    print(f"Resolving input: {args.url}")
+    stream_urls = resolve_input_url(args.url)
+
     if not stream_urls:
-        die("No croaod.cz .mpd/.mp3 streams detected. Try increasing dwell time, or I can tighten selectors.")
+        die(
+            "No croaod.cz .mpd/.mp3 (or inferable .m4s) detected.\n"
+            "Tips:\n"
+            "  - Open the page in your browser, pass any Cloudflare/cookie checks, start playback,\n"
+            "    then copy the .mpd (or a .m4s segment URL) from DevTools → Network and use that as input.\n"
+            "  - Or try another page URL.\n"
+        )
 
     print(f"Detected {len(stream_urls)} stream URL(s).")
     for i, u in enumerate(stream_urls[:6], start=1):
@@ -260,13 +337,15 @@ def main():
     parts = []
     print(f"\nProcessing {len(stream_urls)} stream(s)…")
     for idx, u in enumerate(stream_urls, start=1):
-        print(f"\n[{idx}/{len(stream_urls)}] {'MP3' if MP3_RE.search(u) else 'DASH'}")
+        kind = "MP3" if MP3_RE.search(u) else ("DASH" if MPD_RE.search(u) else ("SEGMENT" if M4S_RE.search(u) else "UNKNOWN"))
+        print(f"\n[{idx}/{len(stream_urls)}] {kind}")
         out_path = tempdir / f"{idx:02d} part.mp3"
         try:
             if MP3_RE.search(u):
                 print(f"[{idx}] Downloading MP3…")
                 download_mp3(u, out_path, referer=args.url)
             else:
+                # For .mpd or inferred from .m4s
                 print(f"[{idx}] Recording DASH via ffmpeg…")
                 record_dash_to_mp3(u, out_path, referer=args.url)
         except subprocess.CalledProcessError as e:
