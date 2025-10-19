@@ -65,11 +65,8 @@ python mujrozhlas_dl.py "https://cdn.croaod.cz/abc/manifest.mpd"
 python mujrozhlas_dl.py "https://cdn.croaod.cz/abc/segment_ctaudio_xyz_mpd.m4s"
 ```
 
-## Sekcia so screenshotom
-Po nahratí súboru so screenshotom ho vložte sem. Názov súboru upravte podľa seba.
-```
+
 ![Ukážka z Network panelu](mujrozhlas.png)
-```
 
 ## Ako to funguje stručne
 - Playwright otvorí stránku a skúša kliknúť na tlačidlá prehrávania, aby sa načítali manifesty alebo segmenty.
